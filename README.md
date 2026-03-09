@@ -18,6 +18,9 @@ A high-performance, real-time barcode scanner component for React Native (Expo).
 
 ## Installation
 
+![WhatsApp Video 2026-03-09 at 15 48 40](https://github.com/user-attachments/assets/d8fbb09a-e1d2-4848-afa4-2bdc59aaae0c)
+
+
 ```bash
 npx expo install rn-camera-barcode-scan
 ```
