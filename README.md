@@ -1,5 +1,7 @@
 # rn-camera-barcode-scan
 
+![WhatsApp Video 2026-03-09 at 15 48 40](https://github.com/user-attachments/assets/d8fbb09a-e1d2-4848-afa4-2bdc59aaae0c)
+
 A high-performance, real-time barcode scanner component for React Native (Expo). Supports 15+ barcode formats on both Android and iOS with native performance.
 
 - **Android** — CameraX + Google ML Kit (on-device, no internet required)
@@ -17,8 +19,6 @@ A high-performance, real-time barcode scanner component for React Native (Expo).
 - Works with both Old Architecture (Bridge) and New Architecture (Fabric + TurboModules)
 
 ## Installation
-
-![WhatsApp Video 2026-03-09 at 15 48 40](https://github.com/user-attachments/assets/d8fbb09a-e1d2-4848-afa4-2bdc59aaae0c)
 
 
 ```bash
