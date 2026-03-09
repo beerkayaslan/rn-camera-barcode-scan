@@ -1,0 +1,60 @@
+{
+  "name": "rn-camera-barcode-scan",
+  "version": "1.4.5",
+  "description": "High-performance barcode scanner component for React Native Expo. Supports all major barcode formats on both Android and iOS.",
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "files": [
+    "build/",
+    "android/",
+    "ios/",
+    "plugin/",
+    "app.plugin.js",
+    "expo-module.config.json",
+    "README.md"
+  ],
+  "expo": {
+    "autolinking": {
+      "nativeModulesDir": "."
+    }
+  },
+  "scripts": {
+    "build": "expo-module build",
+    "clean": "expo-module clean",
+    "lint": "expo-module lint",
+    "test": "expo-module test",
+    "prepare": "expo-module prepare",
+    "prepublishOnly": "expo-module prepublishOnly",
+    "expo-module": "expo-module"
+  },
+  "keywords": [
+    "react-native",
+    "expo",
+    "barcode",
+    "scanner",
+    "qrcode",
+    "camera",
+    "android",
+    "ios"
+  ],
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "author": "",
+  "license": "MIT",
+  "homepage": "",
+  "peerDependencies": {
+    "expo": ">=52.0.0",
+    "react": ">=18.0.0",
+    "react-native": ">=0.76.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.0.0",
+    "expo": ">=52.0.0",
+    "expo-module-scripts": "^4.0.0",
+    "expo-modules-core": "^2.1.0",
+    "react": "^18.0.0",
+    "react-native": ">=0.76.0"
+  }
+}
