@@ -1,6 +1,6 @@
 {
   "name": "rn-camera-barcode-scan",
-  "version": "1.4.5",
+  "version": "1.4.6",
   "description": "High-performance barcode scanner component for React Native Expo. Supports all major barcode formats on both Android and iOS.",
   "main": "build/index.js",
   "types": "build/index.d.ts",
