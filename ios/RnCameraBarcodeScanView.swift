@@ -26,6 +26,11 @@ class RnCameraBarcodeScanView: ExpoView, AVCaptureMetadataOutputObjectsDelegate 
     private var focusIndicatorLayer: CAShapeLayer?
     private var focusFadeTimer: Timer?
     
+    // High-priority serial queue for metadata processing – keeps main thread free
+    private let metadataQueue = DispatchQueue(label: "expo.modules.camerascan.metadata", qos: .userInteractive)
+    // Atomic lock for scan cooldown (accessed from metadataQueue)
+    private let scanLock = NSLock()
+    
     let onBarcodeScan = EventDispatcher()
     
     // All supported barcode types for maximum compatibility
@@ -68,10 +73,46 @@ class RnCameraBarcodeScanView: ExpoView, AVCaptureMetadataOutputObjectsDelegate 
         
         let pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinchToZoom(_:)))
         addGestureRecognizer(pinchGesture)
+        
+        // Pause/resume camera when app goes to background/foreground
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(appWillEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
+        // Re-focus when subject area changes (e.g. user moves to a new barcode)
+        NotificationCenter.default.addObserver(self, selector: #selector(subjectAreaDidChange), name: NSNotification.Name.AVCaptureDeviceSubjectAreaDidChange, object: nil)
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+    
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+    
+    // MARK: - App Lifecycle
+    
+    @objc private func appDidEnterBackground() {
+        pauseCamera()
+    }
+    
+    @objc private func appWillEnterForeground() {
+        guard isActive else { return }
+        resumeCamera()
+    }
+    
+    @objc private func subjectAreaDidChange() {
+        // Re-trigger continuous autofocus when the scene changes
+        guard let device = (captureSession?.inputs.first as? AVCaptureDeviceInput)?.device else { return }
+        do {
+            try device.lockForConfiguration()
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+            device.unlockForConfiguration()
+        } catch {}
     }
     
     // MARK: - Tap to Focus
@@ -314,16 +355,23 @@ class RnCameraBarcodeScanView: ExpoView, AVCaptureMetadataOutputObjectsDelegate 
         }
         
         let session = AVCaptureSession()
-        session.sessionPreset = .high
+        // Batch all configuration changes for atomic commit
+        session.beginConfiguration()
+        
+        // 1280x720 is more than enough for barcode detection and processes much faster than .high
+        session.sessionPreset = .hd1280x720
         
         guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            session.commitConfiguration()
             isSettingUp = false
             return
         }
         
-        // Optimize camera for barcode scanning — close-range focus
+        // Optimize camera hardware for barcode scanning
         do {
             try videoDevice.lockForConfiguration()
+            
+            // --- Focus ---
             // Continuous auto-focus keeps re-evaluating focus
             if videoDevice.isFocusModeSupported(.continuousAutoFocus) {
                 videoDevice.focusMode = .continuousAutoFocus
@@ -340,6 +388,8 @@ class RnCameraBarcodeScanView: ExpoView, AVCaptureMetadataOutputObjectsDelegate 
             if videoDevice.isSmoothAutoFocusSupported {
                 videoDevice.isSmoothAutoFocusEnabled = true
             }
+            
+            // --- Exposure ---
             // Center exposure metering for barcode area
             if videoDevice.isExposurePointOfInterestSupported {
                 videoDevice.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
@@ -347,12 +397,35 @@ class RnCameraBarcodeScanView: ExpoView, AVCaptureMetadataOutputObjectsDelegate 
             if videoDevice.isExposureModeSupported(.continuousAutoExposure) {
                 videoDevice.exposureMode = .continuousAutoExposure
             }
+            
+            // --- Low-light boost ---
+            // Automatically brightens in dim environments
+            if videoDevice.isLowLightBoostSupported {
+                videoDevice.automaticallyEnablesLowLightBoostWhenAvailable = true
+            }
+            
+            // --- Disable Video HDR --- reduces processing overhead
+            if videoDevice.activeFormat.isVideoHDRSupported {
+                videoDevice.automaticallyAdjustsVideoHDREnabled = false
+                videoDevice.isVideoHDREnabled = false
+            }
+            
+            // --- Subject area change monitoring ---
+            // Notifies when scene changes so we can re-trigger AF
+            videoDevice.isSubjectAreaChangeMonitoringEnabled = true
+            
+            // --- Frame rate cap at 30fps ---
+            // Faster frame processing per-frame, avoids wasting GPU on 60fps
+            videoDevice.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+            videoDevice.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            
             videoDevice.unlockForConfiguration()
         } catch {
             // Continue without optimization
         }
         
         guard let videoInput = try? AVCaptureDeviceInput(device: videoDevice) else {
+            session.commitConfiguration()
             isSettingUp = false
             return
         }
@@ -364,7 +437,8 @@ class RnCameraBarcodeScanView: ExpoView, AVCaptureMetadataOutputObjectsDelegate 
         let metadataOutput = AVCaptureMetadataOutput()
         if session.canAddOutput(metadataOutput) {
             session.addOutput(metadataOutput)
-            metadataOutput.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
+            // Use a dedicated high-priority queue instead of main thread
+            metadataOutput.setMetadataObjectsDelegate(self, queue: metadataQueue)
             
             // Filter to only types actually supported by the device
             let available = metadataOutput.availableMetadataObjectTypes
@@ -373,6 +447,9 @@ class RnCameraBarcodeScanView: ExpoView, AVCaptureMetadataOutputObjectsDelegate 
             metadataOutput.metadataObjectTypes = typesToUse
             self.metadataOutput = metadataOutput
         }
+        
+        // Commit all config changes at once
+        session.commitConfiguration()
         
         let previewLayer = AVCaptureVideoPreviewLayer(session: session)
         previewLayer.videoGravity = .resizeAspectFill
@@ -401,31 +478,76 @@ class RnCameraBarcodeScanView: ExpoView, AVCaptureMetadataOutputObjectsDelegate 
         didOutput metadataObjects: [AVMetadataObject],
         from connection: AVCaptureConnection
     ) {
-        guard let metadataObject = metadataObjects.first,
-              let readableObject = metadataObject as? AVMetadataMachineReadableCodeObject,
+        // This callback is on metadataQueue – keep it fast
+        guard !metadataObjects.isEmpty else { return }
+        
+        // Pick the best barcode: prefer the one closest to center of frame
+        let bestObject = pickBestBarcode(from: metadataObjects)
+        guard let readableObject = bestObject as? AVMetadataMachineReadableCodeObject,
               let stringValue = readableObject.stringValue else {
             return
         }
         
-        // Draw bounding box only for successfully decoded barcodes
-        if showBoundingBox {
-            drawBoundingBoxes([metadataObject])
-        }
-        
+        // Thread-safe cooldown check
         let now = Date().timeIntervalSince1970
         let effectiveCooldown = scanDelayMs > 0 ? Double(scanDelayMs) / 1000.0 : scanCooldown
-        if now - lastScannedTime < effectiveCooldown && (scanDelayMs > 0 || stringValue == lastScannedValue) {
-            return
+        scanLock.lock()
+        var shouldSkip = false
+        if now - lastScannedTime < effectiveCooldown {
+            if scanDelayMs > 0 || stringValue == lastScannedValue {
+                shouldSkip = true
+            }
         }
+        if !shouldSkip {
+            lastScannedValue = stringValue
+            lastScannedTime = now
+        }
+        scanLock.unlock()
         
-        lastScannedValue = stringValue
-        lastScannedTime = now
+        if shouldSkip { return }
         
-        onBarcodeScan([
-            "data": stringValue,
-            "type": getBarcodeTypeName(readableObject.type),
-            "format": readableObject.type.rawValue
-        ])
+        let typeName = getBarcodeTypeName(readableObject.type)
+        let rawFormat = readableObject.type.rawValue
+        
+        // Dispatch UI work and event back to main thread
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            // Draw bounding box only for successfully decoded barcodes
+            if self.showBoundingBox {
+                self.drawBoundingBoxes([bestObject])
+            }
+            
+            self.onBarcodeScan([
+                "data": stringValue,
+                "type": typeName,
+                "format": rawFormat
+            ])
+        }
+    }
+    
+    /// From multiple detected barcodes, pick the one closest to the center of the frame.
+    /// This avoids accidentally reporting a barcode at the edge when the user is aiming at center.
+    private func pickBestBarcode(from metadataObjects: [AVMetadataObject]) -> AVMetadataObject {
+        guard metadataObjects.count > 1 else { return metadataObjects[0] }
+        
+        // Center of normalized coordinate space is (0.5, 0.5)
+        let center = CGPoint(x: 0.5, y: 0.5)
+        var bestObject = metadataObjects[0]
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        
+        for obj in metadataObjects {
+            guard (obj as? AVMetadataMachineReadableCodeObject)?.stringValue != nil else { continue }
+            let objCenter = CGPoint(x: obj.bounds.midX, y: obj.bounds.midY)
+            let dx = objCenter.x - center.x
+            let dy = objCenter.y - center.y
+            let dist = dx * dx + dy * dy
+            if dist < bestDistance {
+                bestDistance = dist
+                bestObject = obj
+            }
+        }
+        return bestObject
     }
     
     func stopCamera() {
@@ -440,6 +562,7 @@ class RnCameraBarcodeScanView: ExpoView, AVCaptureMetadataOutputObjectsDelegate 
     }
     
     override func removeFromSuperview() {
+        NotificationCenter.default.removeObserver(self)
         stopCamera()
         clearBoundingBoxes()
         focusFadeTimer?.invalidate()

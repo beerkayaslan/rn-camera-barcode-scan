@@ -10,19 +10,26 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
+import android.hardware.camera2.CaptureRequest
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.util.Range
+import android.util.Size
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import androidx.annotation.OptIn
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -64,9 +71,9 @@ class RnCameraBarcodeScanView(context: Context, appContext: AppContext) : ExpoVi
     // Overlay
     private val overlayView = OverlayView(context)
 
-    // State
-    private var lastScannedValue = ""
-    private var lastScannedTime = 0L
+    // State — @Volatile ensures visibility across cameraExecutor and main thread
+    @Volatile private var lastScannedValue = ""
+    @Volatile private var lastScannedTime = 0L
     private var requestedBarcodeTypes: List<String>? = null
     private var torchEnabled = false
     private var showBoundingBox = true
@@ -273,13 +280,29 @@ class RnCameraBarcodeScanView(context: Context, appContext: AppContext) : ExpoVi
 
         provider.unbindAll()
 
-        val preview = Preview.Builder()
+        // Apply Camera2 BARCODE scene mode for hardware-level optimization
+        val previewBuilder = Preview.Builder()
+        applyCamera2BarcodeOptimizations(previewBuilder)
+        val preview = previewBuilder
             .build()
             .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
-        val imageAnalysis = ImageAnalysis.Builder()
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+        // 1280x720 gives ML Kit enough detail without wasting processing on full-HD frames
+        val resolutionSelector = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    Size(1280, 720),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                )
+            )
             .build()
+
+        val analysisBuilder = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setResolutionSelector(resolutionSelector)
+        // Cap analysis FPS at 30 and apply BARCODE scene mode to analysis pipeline too
+        applyCamera2AnalysisOptimizations(analysisBuilder)
+        val imageAnalysis = analysisBuilder.build()
 
         imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
             val mediaImage = imageProxy.image
@@ -293,12 +316,14 @@ class RnCameraBarcodeScanView(context: Context, appContext: AppContext) : ExpoVi
             barcodeScanner.process(image)
                 .addOnSuccessListener { barcodes ->
                     if (barcodes.isNotEmpty()) {
-                        // Only consider barcodes that were actually decoded AND within the visible crop area
-                        val decodedBarcode = barcodes.firstOrNull { barcode ->
+                        // Filter to barcodes that were decoded AND within visible crop area
+                        val validBarcodes = barcodes.filter { barcode ->
                             barcode.rawValue != null && barcode.boundingBox?.let { box ->
                                 cropRect.contains(box.centerX(), box.centerY())
                             } == true
                         }
+                        // Pick the best barcode: closest to center of frame
+                        val decodedBarcode = pickBestBarcode(validBarcodes, cropRect)
                         if (decodedBarcode != null) {
                             val rawValue = decodedBarcode.rawValue!!
 
@@ -318,7 +343,10 @@ class RnCameraBarcodeScanView(context: Context, appContext: AppContext) : ExpoVi
 
                             val now = System.currentTimeMillis()
                             val effectiveCooldown = if (scanDelayMs > 0) scanDelayMs else SCAN_COOLDOWN_MS
-                            if (now - lastScannedTime < effectiveCooldown && (scanDelayMs > 0 || rawValue == lastScannedValue)) {
+                            val withinCooldown = now - lastScannedTime < effectiveCooldown &&
+                                (scanDelayMs > 0 || rawValue == lastScannedValue)
+
+                            if (withinCooldown) {
                                 // Skip: still within cooldown
                             } else {
                                 lastScannedValue = rawValue
@@ -355,12 +383,72 @@ class RnCameraBarcodeScanView(context: Context, appContext: AppContext) : ExpoVi
                 provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis)
             }
             camera?.cameraControl?.enableTorch(torchEnabled)
+            // Trigger center-weighted autofocus for immediate barcode readiness
+            triggerInitialFocus()
             isCameraRunning = true
             isCameraStarting = false
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind camera use cases", e)
             isCameraStarting = false
         }
+    }
+
+    // Camera2 BARCODE scene mode — tells the camera hardware to optimize
+    // exposure, contrast, and focus specifically for barcode readability
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun applyCamera2BarcodeOptimizations(builder: Preview.Builder) {
+        try {
+            val extender = Camera2Interop.Extender(builder)
+            extender.setCaptureRequestOption(
+                CaptureRequest.CONTROL_MODE,
+                CaptureRequest.CONTROL_MODE_USE_SCENE_MODE
+            )
+            extender.setCaptureRequestOption(
+                CaptureRequest.CONTROL_SCENE_MODE,
+                CaptureRequest.CONTROL_SCENE_MODE_BARCODE
+            )
+        } catch (e: Exception) {
+            Log.d(TAG, "Camera2 BARCODE scene mode not available, using defaults")
+        }
+    }
+
+    // Apply FPS cap and continuous AF to the analysis pipeline
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun applyCamera2AnalysisOptimizations(builder: ImageAnalysis.Builder) {
+        try {
+            val extender = Camera2Interop.Extender(builder)
+            // Cap at 30fps — avoids burning CPU/GPU on 60fps frames
+            extender.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                Range(15, 30)
+            )
+            // Continuous video AF keeps refocusing as user moves camera
+            extender.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+            )
+        } catch (e: Exception) {
+            Log.d(TAG, "Camera2 analysis optimizations not available")
+        }
+    }
+
+    // Immediately focus center of frame after camera bind for fast first-scan
+    private fun triggerInitialFocus() {
+        val cam = camera ?: return
+        val w = previewView.width.toFloat()
+        val h = previewView.height.toFloat()
+        if (w <= 0 || h <= 0) return
+
+        val factory = previewView.meteringPointFactory
+        val centerPoint = factory.createPoint(w / 2f, h / 2f)
+        // FLAG_AF + FLAG_AE + FLAG_AWB for fully optimized metering
+        val action = FocusMeteringAction.Builder(
+                centerPoint,
+                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB
+            )
+            .setAutoCancelDuration(3, TimeUnit.SECONDS)
+            .build()
+        cam.cameraControl.startFocusAndMetering(action)
     }
 
     fun stopCamera() {
@@ -410,6 +498,21 @@ class RnCameraBarcodeScanView(context: Context, appContext: AppContext) : ExpoVi
     }
 
     // ─── Barcode Scanner ────────────────────────────────────────────────
+
+    /// From multiple decoded barcodes, pick the one closest to the center of the crop rect.
+    private fun pickBestBarcode(barcodes: List<Barcode>, cropRect: Rect): Barcode? {
+        if (barcodes.isEmpty()) return null
+        if (barcodes.size == 1) return barcodes[0]
+
+        val centerX = cropRect.centerX().toFloat()
+        val centerY = cropRect.centerY().toFloat()
+        return barcodes.minByOrNull { barcode ->
+            val box = barcode.boundingBox ?: return@minByOrNull Float.MAX_VALUE
+            val dx = box.centerX() - centerX
+            val dy = box.centerY() - centerY
+            dx * dx + dy * dy.toFloat()
+        }
+    }
 
     private fun buildBarcodeScanner(types: List<String>?): BarcodeScanner {
         val builder = BarcodeScannerOptions.Builder()
